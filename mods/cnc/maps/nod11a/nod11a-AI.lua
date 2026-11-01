@@ -137,6 +137,7 @@ AttackScheduleStarted = false
 -- Set for good once the GDI Construction Yard is destroyed or captured: no more waves.
 WavesStopped = false
 Atk1Sent = false
+Atk1Pending = false
 ProducedGDIUnits = {}
 ProductionBusy = {}
 OrcaBusy = nil
@@ -377,8 +378,8 @@ end
 --    are killed (OnKilled) and buildings GDI sold for money come back once the
 --    economy runs again.
 --  * One building at a time, paid up front, placed after its normal build time.
---  * Order by importance (Construction Yard first); an unaffordable important
---    building does not block cheap ones (<= RebuildCheapCost).
+--  * Order by importance (Construction Yard first); the first affordable
+--    building in that order is rebuilt next.
 --  * Everything except the Construction Yard needs a living Construction Yard.
 --  * The site must be free: GDI units are sent away, enemy units are waited out.
 RebuildQueue = {}
@@ -386,7 +387,6 @@ RebuildWorkerRunning = false
 RebuildBusy = false
 RebuildPending = {}
 RebuildPollSeconds = 5
-RebuildCheapCost = 500
 RebuildSiteTimeoutAttempts = 30
 -- Seconds a sold building needs before it counts as gone (sell animation).
 RebuildSoldDelaySeconds = 15
@@ -394,8 +394,8 @@ RebuildSoldDelaySeconds = 15
 GDIBuildingPriority = { fact = 1, proc = 2, weap = 3, pyle = 4, hq = 5, nuke = 6, atwr = 7, gtwr = 8, hpad = 9, silo = 10 }
 -- Occupied cells (width, height) of each building, used for the free-site check.
 GDIBuildingFootprint = {
-	fact = { 3, 2 }, proc = { 3, 3 }, weap = { 3, 2 }, pyle = { 2, 2 }, hq = { 2, 2 },
-	nuke = { 2, 2 }, atwr = { 1, 2 }, gtwr = { 1, 1 }, hpad = { 2, 2 }, silo = { 2, 1 },
+	fact = { 3, 3 }, proc = { 3, 4 }, weap = { 3, 3 }, pyle = { 2, 3 }, hq = { 2, 3 },
+	nuke = { 2, 3 }, atwr = { 1, 1 }, gtwr = { 1, 1 }, hpad = { 2, 2 }, silo = { 2, 1 },
 }
 -- Hard: restored every time they are killed.
 HardRebuildTypes = { fact = true, proc = true, weap = true, pyle = true }
@@ -568,9 +568,9 @@ PickRebuildCandidate = function()
 		return GDIBuildingPriority[a.building.type] < GDIBuildingPriority[b.building.type]
 	end)
 
-	for index, entry in ipairs(eligible) do
+	for _, entry in ipairs(eligible) do
 		local cost = Actor.Cost(entry.building.type)
-		if GDI.Cash >= cost and (index == 1 or cost <= RebuildCheapCost) then
+		if GDI.Cash >= cost then
 			return entry
 		end
 	end
@@ -768,7 +768,9 @@ ProduceOrca = function()
 	local retry = function() ProduceOrca() end
 	local pads = GDI.GetActorsByType("hpad")
 
-	if #pads == 0 or #GDI.GetActorsByType("harv") == 0
+	-- Same economy rule as ProduceGDIUnit: refinery and affordable funds.
+	if #pads == 0 or #GDI.GetActorsByType("proc") == 0
+		or GDI.Cash + GDI.Resources < 500
 		or #GDI.GetActorsByType("orca") >= MaxOrcas[Difficulty or "normal"] then
 		Trigger.AfterDelay(DateTime.Seconds(15), retry)
 		return
@@ -816,8 +818,10 @@ ProduceGDIUnit = function(buildingType)
 	local retry = function() ProduceGDIUnit(buildingType) end
 	local factories = GDI.GetActorsByType(buildingType)
 
-	-- Production depends on the economy: no harvester, no new units.
-	if #factories == 0 or #GDI.GetActorsByType("harv") == 0
+	-- Only the refinery and affordable funds count; otherwise easy/normal
+	-- would stop forever (CheckGDIEconomy only runs on hard).
+	if #factories == 0 or #GDI.GetActorsByType("proc") == 0
+		or GDI.Cash + GDI.Resources < 500
 		or CountProducedUnits() >= MaxProducedUnits[Difficulty or "normal"] then
 		TrySendGroup()
 		Trigger.AfterDelay(DateTime.Seconds(10), retry)
@@ -867,7 +871,7 @@ end
 -- Construction Yard, HQ, Weapons Factory or Refinery; power plants only last
 -- and only while power stays sufficient), (4) as a last resort all
 -- GDI ground units and Orcas attack.
-EconomySellOrder = { "hpad", "silo", "gtwr", "atwr", "pyle" }
+EconomySellOrder = { "silo", "gtwr", "atwr", "pyle", "hpad" }
 -- Power plants are sold last and only while the remaining power still covers
 -- the drain (never the HQ: it is not in any sell list).
 PowerPlantType = "nuke"
@@ -938,7 +942,9 @@ SellForEconomy = function()
 	local candidate = nil
 	for _, buildingType in ipairs(EconomySellOrder) do
 		local list = GDI.GetActorsByType(buildingType)
-		if #list > 0 then
+		-- Orcas need the helipad to repair and return: sold last.
+		local keepPad = buildingType == "hpad" and #GDI.GetActorsByType("orca") > 0
+		if #list > 0 and not keepPad then
 			candidate = list[1]
 			break
 		end
@@ -988,7 +994,7 @@ CheckGDIEconomy = function()
 	local refineries = GDI.GetActorsByType("proc")
 
 	if #factories > 0 and #refineries > 0 then
-		if GDIFunds() >= Actor.Cost("harv") then
+		if GDI.Cash >= Actor.Cost("harv") then
 			BuildGDIHarvester(factories[1])
 			return
 		end
@@ -1049,6 +1055,13 @@ StartAttackSchedule = function()
 	end
 
 	AttackScheduleStarted = true
+
+	-- atk1 was entered before the takeover: send it now.
+	if Atk1Pending and not Atk1Sent then
+		Atk1Sent = true
+		AttackWave(TeamDefs.atk1)
+	end
+
 	local times = WaveTimes[Difficulty or "normal"]
 
 	Trigger.AfterDelay(DateTime.Seconds(4), StartMammothPatrol)
@@ -1082,6 +1095,9 @@ SetupAI = function()
 			Atk1Sent = true
 			Trigger.RemoveFootprintTrigger(id)
 			AttackWave(TeamDefs.atk1)
+		elseif actor.Owner == Nod and not BaseTakenOver then
+			-- Base not yet taken over: keep the trigger, StartAttackSchedule sends the team.
+			Atk1Pending = true
 		end
 	end)
 
@@ -1133,6 +1149,4 @@ SetupAI = function()
 	Trigger.OnKilled(GDIHQ, function()
 		AirstrikeDisabled = true
 	end)
-
-	TryStartGDIProduction()
 end
