@@ -403,8 +403,8 @@ end
 --    are killed (OnKilled) and buildings GDI sold for money come back once the
 --    economy runs again.
 --  * One building at a time, paid up front, placed after its normal build time.
---  * Order by importance (Construction Yard first); an unaffordable important
---    building does not block cheap ones (<= RebuildCheapCost).
+--  * Order by importance (Construction Yard first); the first affordable
+--    building in that order is rebuilt next.
 --  * Everything except the Construction Yard needs a living Construction Yard.
 --  * The site must be free: GDI units are sent away, enemy units are waited out.
 RebuildQueue = {}
@@ -412,7 +412,6 @@ RebuildWorkerRunning = false
 RebuildBusy = false
 RebuildPending = {}
 RebuildPollSeconds = 5
-RebuildCheapCost = 500
 RebuildSiteTimeoutAttempts = 30
 -- Seconds a sold building needs before it counts as gone (sell animation).
 RebuildSoldDelaySeconds = 15
@@ -420,8 +419,8 @@ RebuildSoldDelaySeconds = 15
 GDIBuildingPriority = { fact = 1, proc = 2, weap = 3, pyle = 4, hq = 5, nuke = 6, atwr = 7, gtwr = 8, hpad = 9, silo = 10 }
 -- Occupied cells (width, height) of each building, used for the free-site check.
 GDIBuildingFootprint = {
-	fact = { 3, 2 }, proc = { 3, 3 }, weap = { 3, 2 }, pyle = { 2, 2 }, hq = { 2, 2 },
-	nuke = { 2, 2 }, atwr = { 1, 2 }, gtwr = { 1, 1 }, hpad = { 2, 2 }, silo = { 2, 1 },
+	fact = { 3, 3 }, proc = { 3, 4 }, weap = { 3, 3 }, pyle = { 2, 3 }, hq = { 2, 3 },
+	nuke = { 2, 3 }, atwr = { 1, 1 }, gtwr = { 1, 1 }, hpad = { 2, 2 }, silo = { 2, 1 },
 }
 -- Hard: restored every time they are killed.
 HardRebuildTypes = { fact = true, proc = true, weap = true, pyle = true }
@@ -594,9 +593,9 @@ PickRebuildCandidate = function()
 		return GDIBuildingPriority[a.building.type] < GDIBuildingPriority[b.building.type]
 	end)
 
-	for index, entry in ipairs(eligible) do
+	for _, entry in ipairs(eligible) do
 		local cost = Actor.Cost(entry.building.type)
-		if GDI.Cash >= cost and (index == 1 or cost <= RebuildCheapCost) then
+		if GDI.Cash >= cost then
 			return entry
 		end
 	end
@@ -794,7 +793,9 @@ ProduceOrca = function()
 	local retry = function() ProduceOrca() end
 	local pads = GDI.GetActorsByType("hpad")
 
-	if #pads == 0 or #GDI.GetActorsByType("harv") == 0
+	-- Same economy rule as ProduceGDIUnit: refinery and affordable funds.
+	if #pads == 0 or #GDI.GetActorsByType("proc") == 0
+		or GDI.Cash + GDI.Resources < 500
 		or #GDI.GetActorsByType("orca") >= MaxOrcas[Difficulty or "normal"] then
 		Trigger.AfterDelay(DateTime.Seconds(15), retry)
 		return
@@ -842,8 +843,10 @@ ProduceGDIUnit = function(buildingType)
 	local retry = function() ProduceGDIUnit(buildingType) end
 	local factories = GDI.GetActorsByType(buildingType)
 
-	-- Production depends on the economy: no harvester, no new units.
-	if #factories == 0 or #GDI.GetActorsByType("harv") == 0
+	-- Only the refinery and affordable funds count; otherwise easy/normal
+	-- would stop forever (CheckGDIEconomy only runs on hard).
+	if #factories == 0 or #GDI.GetActorsByType("proc") == 0
+		or GDI.Cash + GDI.Resources < 500
 		or CountProducedUnits() >= MaxProducedUnits[Difficulty or "normal"] then
 		TrySendGroup()
 		Trigger.AfterDelay(DateTime.Seconds(10), retry)
@@ -893,7 +896,7 @@ end
 -- Construction Yard, HQ, Weapons Factory or Refinery; power plants only last
 -- and only while power stays sufficient), (4) as a last resort all
 -- GDI ground units and Orcas attack.
-EconomySellOrder = { "hpad", "silo", "gtwr", "atwr", "pyle" }
+EconomySellOrder = { "silo", "gtwr", "atwr", "pyle", "hpad" }
 -- Power plants are sold last and only while the remaining power still covers
 -- the drain (never the HQ: it is not in any sell list).
 PowerPlantType = "nuke"
@@ -906,10 +909,6 @@ HarvesterBuilding = false
 RefineryBusy = false
 LastEconomySale = -100000
 AllOutAttackStarted = false
-
-GDIFunds = function()
-	return GDI.Cash + GDI.Resources
-end
 
 BuildGDIHarvester = function(factory)
 	HarvesterBuilding = true
@@ -939,17 +938,32 @@ BuildGDIHarvester = function(factory)
 end
 
 -- Creates the refinery at `position` (paid, after its build time). A fresh
--- refinery spawns a free harvester.
-CreateGDIRefinery = function(position, delay)
+-- refinery spawns a free harvester. If the money was spent in the meantime
+-- the refinery is not dropped: the payment is retried (RefineryPayAttempts).
+RefineryPayAttempts = 12
+CreateGDIRefinery = function(position, delay, attempt)
+	attempt = attempt or 0
 	RefineryBusy = true
 	Trigger.AfterDelay(delay, function()
 		local cost = Actor.Cost("proc")
 		if GDI.Cash >= cost then
 			GDI.Cash = GDI.Cash - cost
 			RegisterGDIBuilding(Actor.Create("proc", true, { Owner = GDI, Location = position }))
+			RefineryBusy = false
+		elseif attempt < RefineryPayAttempts then
+			CreateGDIRefinery(position, DateTime.Seconds(5), attempt + 1)
+		else
+			RefineryBusy = false
 		end
-		RefineryBusy = false
 	end)
+end
+
+-- Engine default Sellable.RefundPercent: a sold building returns 50 % of its
+-- cost, scaled by its health. Replacing a refinery therefore nets
+-- cost - refund for GDI (the sale is credited before the new refinery is paid).
+ReplaceRefundPercent = 50
+ProcRefund = function(proc)
+	return math.floor(Actor.Cost("proc") * ReplaceRefundPercent * proc.Health / (100 * proc.MaxHealth))
 end
 
 ReplaceGDIRefinery = function(proc)
@@ -964,7 +978,9 @@ SellForEconomy = function()
 	local candidate = nil
 	for _, buildingType in ipairs(EconomySellOrder) do
 		local list = GDI.GetActorsByType(buildingType)
-		if #list > 0 then
+		-- Orcas need the helipad to repair and return: sold last.
+		local keepPad = buildingType == "hpad" and #GDI.GetActorsByType("orca") > 0
+		if #list > 0 and not keepPad then
 			candidate = list[1]
 			break
 		end
@@ -1014,12 +1030,13 @@ CheckGDIEconomy = function()
 	local refineries = GDI.GetActorsByType("proc")
 
 	if #factories > 0 and #refineries > 0 then
-		if GDIFunds() >= Actor.Cost("harv") then
+		if GDI.Cash >= Actor.Cost("harv") then
 			BuildGDIHarvester(factories[1])
 			return
 		end
-	elseif GDI.Cash >= Actor.Cost("proc") then
+	elseif GDI.Cash + (#refineries > 0 and ProcRefund(refineries[1]) or 0) >= Actor.Cost("proc") then
 		-- No factory (or no refinery): a new refinery brings a free harvester.
+		-- A replacement is paid partly by the refund of the sold refinery.
 		if #refineries > 0 then
 			ReplaceGDIRefinery(refineries[1])
 		else
@@ -1208,6 +1225,4 @@ SetupAI = function()
 	Trigger.OnKilled(GDIHQ, function()
 		AirstrikeDisabled = true
 	end)
-
-	TryStartGDIProduction()
 end
