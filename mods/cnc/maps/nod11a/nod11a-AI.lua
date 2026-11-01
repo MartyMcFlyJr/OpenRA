@@ -917,17 +917,32 @@ BuildGDIHarvester = function(factory)
 end
 
 -- Creates the refinery at `position` (paid, after its build time). A fresh
--- refinery spawns a free harvester.
-CreateGDIRefinery = function(position, delay)
+-- refinery spawns a free harvester. If the money was spent in the meantime
+-- the refinery is not dropped: the payment is retried (RefineryPayAttempts).
+RefineryPayAttempts = 12
+CreateGDIRefinery = function(position, delay, attempt)
+	attempt = attempt or 0
 	RefineryBusy = true
 	Trigger.AfterDelay(delay, function()
 		local cost = Actor.Cost("proc")
 		if GDI.Cash >= cost then
 			GDI.Cash = GDI.Cash - cost
 			RegisterGDIBuilding(Actor.Create("proc", true, { Owner = GDI, Location = position }))
+			RefineryBusy = false
+		elseif attempt < RefineryPayAttempts then
+			CreateGDIRefinery(position, DateTime.Seconds(5), attempt + 1)
+		else
+			RefineryBusy = false
 		end
-		RefineryBusy = false
 	end)
+end
+
+-- Engine default Sellable.RefundPercent: a sold building returns 50 % of its
+-- cost, scaled by its health. Replacing a refinery therefore nets
+-- cost - refund for GDI (the sale is credited before the new refinery is paid).
+ReplaceRefundPercent = 50
+ProcRefund = function(proc)
+	return math.floor(Actor.Cost("proc") * ReplaceRefundPercent * proc.Health / (100 * proc.MaxHealth))
 end
 
 ReplaceGDIRefinery = function(proc)
@@ -998,8 +1013,9 @@ CheckGDIEconomy = function()
 			BuildGDIHarvester(factories[1])
 			return
 		end
-	elseif GDI.Cash >= Actor.Cost("proc") then
+	elseif GDI.Cash + (#refineries > 0 and ProcRefund(refineries[1]) or 0) >= Actor.Cost("proc") then
 		-- No factory (or no refinery): a new refinery brings a free harvester.
+		-- A replacement is paid partly by the refund of the sold refinery.
 		if #refineries > 0 then
 			ReplaceGDIRefinery(refineries[1])
 		else
